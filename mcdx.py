@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
