@@ -23,14 +23,13 @@ itself.
 
 ```bash
 # Recommended: pipx (isolated environment, mcdx lands on your PATH)
-pipx install git+https://github.com/zackaryjing/multi-account-codex
+pipx install mcdx
 
 # Or plain pip
-pip install --user git+https://github.com/zackaryjing/multi-account-codex
+pip install --user mcdx
 ```
 
-*(Once the package is published to PyPI, this becomes a simple
-`pipx install mcdx`.)*
+Published on [PyPI](https://pypi.org/project/mcdx/).
 
 ### Install from a clone
 
