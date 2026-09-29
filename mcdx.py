@@ -2,7 +2,9 @@
 """Switch between saved Codex auth profiles.
 
 This tool intentionally manages only ~/.codex/auth.json. Runtime state and
-config.toml stay owned by Codex itself.
+config.toml stay owned by Codex itself -- including the long-lived app-server
+daemon, which is asked to restart (never reimplemented) so that it reloads the
+credentials swapped in here.
 """
 
 from __future__ import annotations
@@ -20,12 +22,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 
 PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RESERVED_LAST = "_last"
 RESERVED_PROFILES = {RESERVED_LAST}
+
+DAEMON_QUERY_TIMEOUT = 15
+DAEMON_RESTART_TIMEOUT = 120
 
 
 class McdxError(Exception):
@@ -294,6 +299,91 @@ def cmd_save_current(args: argparse.Namespace) -> int:
     return 0 if save_profile(args.name, path, yes=args.yes) else 2
 
 
+def codex_bin() -> str:
+    return os.environ.get("MCDX_CODEX_BIN", "codex")
+
+
+def app_server_daemon_status() -> str | None:
+    """Return the Codex app-server daemon status, or None if it cannot be read."""
+    try:
+        proc = subprocess.run(
+            [codex_bin(), "app-server", "daemon", "version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=DAEMON_QUERY_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in reversed(proc.stdout.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        status = payload.get("status") if isinstance(payload, dict) else None
+        return str(status) if status else None
+    return None
+
+
+def restart_app_server_daemon(assume_yes: bool = False) -> None:
+    """Make Codex reload auth.json by restarting its app-server daemon.
+
+    Codex >= 0.158 keeps a long-lived app-server daemon that reads auth.json
+    once at startup; sessions talk to that daemon instead of reading the file
+    themselves, so a swapped auth.json is ignored until the daemon restarts.
+    """
+    status = app_server_daemon_status()
+    if status is None:
+        print(
+            "mcdx: note: could not query the Codex app-server daemon; if codex keeps using "
+            "the previous account, run: codex app-server daemon restart",
+            file=sys.stderr,
+        )
+        return
+    if status != "running":
+        return
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            print(
+                "mcdx: note: the Codex app-server daemon is still serving the previous "
+                "account; rerun with -y, or run: codex app-server daemon restart",
+                file=sys.stderr,
+            )
+            return
+        if not prompt_yes_no(
+            "restart the Codex app-server daemon now?"
+            " (running codex sessions will be interrupted)",
+            True,
+        ):
+            print(
+                "mcdx: note: daemon not restarted; codex keeps using the previous account",
+                file=sys.stderr,
+            )
+            return
+    try:
+        result = subprocess.run(
+            [codex_bin(), "app-server", "daemon", "restart"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=DAEMON_RESTART_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"mcdx: warning: could not restart the app-server daemon ({exc})", file=sys.stderr)
+        return
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        hint = f": {detail[-1]}" if detail else ""
+        print(f"mcdx: warning: app-server daemon restart failed{hint}", file=sys.stderr)
+        return
+    print("restarted the Codex app-server daemon")
+
+
 def restore_auth_from_backup(backup: Path | None) -> None:
     current = auth_path()
     if backup and backup.exists():
@@ -314,9 +404,8 @@ def cmd_add(args: argparse.Namespace) -> int:
             atomic_copy(current, backup)
             current.unlink()
 
-        codex_bin = os.environ.get("MCDX_CODEX_BIN", "codex")
-        print(f"running: {codex_bin} login --device-auth")
-        result = subprocess.run([codex_bin, "login", "--device-auth"])
+        print(f"running: {codex_bin()} login --device-auth")
+        result = subprocess.run([codex_bin(), "login", "--device-auth"])
         if result.returncode != 0:
             restore_auth_from_backup(backup)
             raise McdxError("codex login failed; previous auth restored")
@@ -333,6 +422,8 @@ def cmd_add(args: argparse.Namespace) -> int:
             print("add canceled; previous auth restored")
             return 2
         print(f"active profile is now '{args.name}'")
+        if not args.no_daemon_restart:
+            restart_app_server_daemon(assume_yes=args.yes)
         return 0
 
 
@@ -345,6 +436,10 @@ def cmd_switch(args: argparse.Namespace) -> int:
     active = current_info()
     if active and active.get("auth_sha256") == target_info.get("auth_sha256"):
         print(f"already using '{args.name}' ({format_identity(target_info)})")
+        # auth.json may already match while a running daemon still serves the
+        # previous account, so this path must be able to reload it too.
+        if not args.no_daemon_restart:
+            restart_app_server_daemon(assume_yes=args.yes)
         return 0
     if active:
         save_profile(RESERVED_LAST, auth_path(), yes=True, allow_duplicate=True)
@@ -352,6 +447,8 @@ def cmd_switch(args: argparse.Namespace) -> int:
     print(f"switched to '{args.name}' ({format_identity(target_info)})")
     if active:
         print(f"previous auth saved as '{RESERVED_LAST}' ({format_identity(active)})")
+    if not args.no_daemon_restart:
+        restart_app_server_daemon(assume_yes=args.yes)
     return 0
 
 
@@ -404,9 +501,11 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 
     print(f"codex_home: {codex_home()}")
     print(f"data_home:  {data_home()}")
-    print(f"codex bin:  {shutil.which(os.environ.get('MCDX_CODEX_BIN', 'codex')) or 'not found'}")
+    print(f"codex bin:  {shutil.which(codex_bin()) or 'not found'}")
     print(f"auth:       {format_identity(current_info()) if auth_path().exists() else 'missing'}")
     print(f"profiles:   {len(list_profile_names())}")
+    daemon = app_server_daemon_status()
+    print(f"daemon:     {daemon or 'unknown (could not run: codex app-server daemon version)'}")
     for path in [codex_home(), profiles_dir()]:
         if path.exists():
             print(f"{path}: exists")
@@ -430,11 +529,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("add", help="login with Codex device auth and save as a profile")
     p.add_argument("name")
-    p.add_argument("-y", "--yes", action="store_true", help="answer yes to overwrite/duplicate prompts")
+    p.add_argument("-y", "--yes", action="store_true", help="answer yes to prompts (overwrite/duplicate, daemon restart)")
+    p.add_argument(
+        "--no-daemon-restart",
+        action="store_true",
+        help="do not restart the Codex app-server daemon (it may keep using the previous account)",
+    )
     p.set_defaults(func=cmd_add)
 
     p = sub.add_parser("switch", help="switch active Codex auth to a profile")
     p.add_argument("name")
+    p.add_argument("-y", "--yes", action="store_true", help="answer yes to prompts (daemon restart)")
+    p.add_argument(
+        "--no-daemon-restart",
+        action="store_true",
+        help="do not restart the Codex app-server daemon (it may keep using the previous account)",
+    )
     p.set_defaults(func=cmd_switch)
 
     p = sub.add_parser("remove", help="remove a saved profile")

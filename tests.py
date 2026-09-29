@@ -33,10 +33,56 @@ def write_auth(path: Path, account_id: str, token: str = "token") -> None:
     path.chmod(0o600)
 
 
+def write_fake_codex(path: Path, codex_home: Path, state: Path) -> None:
+    """Stand-in for the codex CLI: device-auth login plus app-server daemon control.
+
+    Daemon status is read from `state/daemon_status` so tests can flip it, and
+    every restart is appended to `state/daemon_restarts`.
+    """
+    path.write_text(
+        f'''#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+codex_home = Path({str(codex_home)!r})
+state = Path({str(state)!r})
+args = sys.argv[1:]
+
+if args[:3] == ["app-server", "daemon", "version"]:
+    status_file = state / "daemon_status"
+    status = status_file.read_text().strip() if status_file.exists() else "not running"
+    print(json.dumps({{"status": status}}))
+    raise SystemExit(0)
+
+if args[:3] == ["app-server", "daemon", "restart"]:
+    with (state / "daemon_restarts").open("a") as fh:
+        fh.write("restart\\n")
+    print(json.dumps({{"status": "restarted"}}))
+    raise SystemExit(0)
+
+if args[:1] == ["login"]:
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "auth.json").write_text(json.dumps({{
+        "auth_mode": "chatgpt",
+        "tokens": {{"id_token": "id-new", "access_token": "access-new",
+                   "refresh_token": "refresh-new", "account_id": "acct-new"}},
+    }}))
+    raise SystemExit(0)
+
+print(f"fake codex: unexpected args {{args}}", file=sys.stderr)
+raise SystemExit(64)
+''',
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 def run(env: dict[str, str], *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     cp = subprocess.run(
         [sys.executable, str(MCDX), *args],
         env=env,
+        stdin=subprocess.DEVNULL,  # nothing here should ever block on a prompt
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -46,36 +92,74 @@ def run(env: dict[str, str], *args: str, check: bool = True) -> subprocess.Compl
     return cp
 
 
+def restarts(state: Path) -> list[str]:
+    log = state / "daemon_restarts"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def account_of(path: Path) -> str:
+    return json.loads(path.read_text())["tokens"]["account_id"]
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="mcdx-test-") as td:
         base = Path(td)
         codex_home = base / "codex"
         data_home = base / "data"
+        auth = codex_home / "auth.json"
+        state = base / "fake-state"
+        state.mkdir()
+        # The whole suite runs against the fake, so it never touches the real
+        # codex CLI -- or the real app-server daemon holding your credentials.
         env = os.environ.copy()
         env["MCDX_CODEX_HOME"] = str(codex_home)
         env["MCDX_DATA_HOME"] = str(data_home)
+        env["MCDX_CODEX_BIN"] = str(base / "fake-codex")
+        write_fake_codex(base / "fake-codex", codex_home, state)
 
-        write_auth(codex_home / "auth.json", "acct-main", "main")
+        write_auth(auth, "acct-main", "main")
         run(env, "save-current", "main", "-y")
         assert "main" in run(env, "list").stdout
         assert "main" in run(env, "current").stdout
 
-        write_auth(codex_home / "auth.json", "acct-alt", "alt")
+        write_auth(auth, "acct-alt", "alt")
         run(env, "save-current", "alt", "-y")
+
+        # No daemon running: switching is a plain file swap, no restart needed.
         run(env, "switch", "main")
-        active = json.loads((codex_home / "auth.json").read_text())
-        assert active["tokens"]["account_id"] == "acct-main"
+        assert account_of(auth) == "acct-main"
         assert (data_home / "profiles" / "_last" / "auth.json").exists()
         assert "current: main" in run(env, "current").stdout
+        assert restarts(state) == []
+
+        # A running daemon still serves the previous account, so mcdx asks.
+        (state / "daemon_status").write_text("running")
+        asked = run(env, "switch", "alt")
+        assert account_of(auth) == "acct-alt"  # the file swap still happens
+        assert "still serving the previous account" in asked.stderr
+        assert restarts(state) == []
+
+        # -y answers that prompt and reloads the daemon.
+        run(env, "switch", "main", "-y")
+        assert restarts(state) == ["restart"]
+
+        # --no-daemon-restart is the explicit opt-out.
+        run(env, "switch", "alt", "-y", "--no-daemon-restart")
+        assert restarts(state) == ["restart"]
+
+        # Switching to the profile that is already active must still be able to
+        # reload a daemon that is stuck on the previous account.
+        already = run(env, "switch", "alt", "-y")
+        assert "already using 'alt'" in already.stdout
+        assert restarts(state) == ["restart", "restart"]
 
         run(env, "rename", "alt", "renamed-alt")
         assert "renamed-alt" in run(env, "list").stdout
         assert not (data_home / "profiles" / "alt").exists()
         renamed_meta = json.loads((data_home / "profiles" / "renamed-alt" / "metadata.json").read_text())
         assert renamed_meta["name"] == "renamed-alt"
-        run(env, "switch", "renamed-alt")
-        active = json.loads((codex_home / "auth.json").read_text())
-        assert active["tokens"]["account_id"] == "acct-alt"
+        run(env, "switch", "renamed-alt", "-y")
+        assert account_of(auth) == "acct-alt"
         assert "current: renamed-alt" in run(env, "current").stdout
         list_output = run(env, "list").stdout
         assert "* renamed-alt" in list_output
@@ -88,20 +172,21 @@ def main() -> int:
         assert duplicate.returncode == 2
         assert "same credential already exists" in duplicate.stderr
 
-        fake = base / "fake-codex"
-        fake.write_text(
-            f"""#!/bin/sh
-mkdir -p {codex_home!s}
-cat > {codex_home / 'auth.json'} <<'JSON'
-{{"auth_mode":"chatgpt","tokens":{{"id_token":"id-new","access_token":"access-new","refresh_token":"refresh-new","account_id":"acct-new"}}}}
-JSON
-""",
-            encoding="utf-8",
-        )
-        fake.chmod(0o755)
-        env["MCDX_CODEX_BIN"] = str(fake)
+        # add logs in via device auth and must also pick the new login up.
+        before = len(restarts(state))
         run(env, "add", "new", "-y")
         assert "new" in run(env, "current").stdout
+        assert len(restarts(state)) == before + 1
+        assert "daemon:     running" in run(env, "doctor").stdout
+
+        # An unusable codex binary must not turn a working switch into a failure.
+        (state / "daemon_status").write_text("not running")
+        broken = os.environ.copy()
+        broken.update(env)
+        broken["MCDX_CODEX_BIN"] = str(base / "missing-codex")
+        unreachable = run(broken, "switch", "main", "-y")
+        assert account_of(auth) == "acct-main"
+        assert "could not query the Codex app-server daemon" in unreachable.stderr
 
     print("tests passed")
     return 0
