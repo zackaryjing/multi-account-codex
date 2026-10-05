@@ -10,19 +10,21 @@ credentials swapped in here.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -31,10 +33,21 @@ RESERVED_PROFILES = {RESERVED_LAST}
 
 DAEMON_QUERY_TIMEOUT = 15
 DAEMON_RESTART_TIMEOUT = 120
+TERMINATION_SIGNALS = tuple(
+    sig for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)) if sig is not None
+)
 
 
 class McdxError(Exception):
     pass
+
+
+class Interrupted(Exception):
+    """Raised inside a login swap when the process is asked to terminate."""
+
+    def __init__(self, signum: int):
+        super().__init__(f"terminated by signal {signum}")
+        self.signum = signum
 
 
 def now_iso() -> str:
@@ -194,6 +207,78 @@ def atomic_copy(src: Path, dst: Path, mode: int = 0o600) -> None:
     os.replace(tmp_path, dst)
 
 
+def journal_path() -> Path:
+    return data_home() / "in-progress.json"
+
+
+def pending_auth_path() -> Path:
+    return data_home() / "in-progress-auth.json"
+
+
+def begin_journal(operation: str, name: str, had_active: bool) -> None:
+    """Record an in-flight auth swap so it can be rolled back after a crash."""
+    data_dir = data_home()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(data_dir, 0o700)
+    journal = {
+        "operation": operation,
+        "name": name,
+        "had_active": had_active,
+        "started_at": now_iso(),
+    }
+    tmp = journal_path().with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(journal, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, journal_path())
+
+
+def clear_journal() -> None:
+    journal_path().unlink(missing_ok=True)
+    pending_auth_path().unlink(missing_ok=True)
+
+
+def rollback_pending() -> None:
+    """Undo an interrupted swap: put the pre-login auth back and forget it."""
+    pending = pending_auth_path()
+    if pending.exists():
+        atomic_copy(pending, auth_path())
+    elif auth_path().exists():
+        # There was no previous auth; drop whatever the aborted login left.
+        auth_path().unlink()
+    clear_journal()
+
+
+def recover_interrupted() -> None:
+    """Roll back an add/update that died before it could clean up.
+
+    Runs before every command so a SIGKILL, power loss, or vanished terminal
+    cannot leave the active auth.json missing or half-swapped.
+    """
+    if not journal_path().exists():
+        return
+    try:
+        journal = load_json(journal_path())
+    except McdxError:
+        journal = {}
+    name = journal.get("name")
+    label = f"{journal.get('operation', 'operation')} {name!r}" if name else "operation"
+    if not auth_path().exists() and pending_auth_path().exists():
+        atomic_copy(pending_auth_path(), auth_path())
+        clear_journal()
+        print(
+            f"mcdx: recovered from an interrupted '{label}': restored the previous auth.json",
+            file=sys.stderr,
+        )
+    else:
+        clear_journal()
+        print(
+            f"mcdx: cleaned up leftover state from an interrupted '{label}'",
+            file=sys.stderr,
+        )
+
+
 def write_metadata(name: str, info: dict[str, Any], created_at: str | None = None) -> None:
     meta_path = profile_meta(name)
     existing = load_metadata(name) if meta_path.exists() else None
@@ -213,7 +298,9 @@ def write_metadata(name: str, info: dict[str, Any], created_at: str | None = Non
     os.replace(tmp, meta_path)
 
 
-def save_profile(name: str, src_auth: Path, yes: bool = False, allow_duplicate: bool = False) -> bool:
+def save_profile(
+    name: str, src_auth: Path, yes: bool = False, allow_duplicate: bool = False, verb: str = "saved"
+) -> bool:
     validate_profile_name(name)
     ensure_dirs()
     info = auth_info(src_auth)
@@ -235,7 +322,7 @@ def save_profile(name: str, src_auth: Path, yes: bool = False, allow_duplicate: 
     created_at = (load_metadata(name) or {}).get("created_at") if profile_meta(name).exists() else None
     atomic_copy(src_auth, target_auth)
     write_metadata(name, info, created_at)
-    print(f"saved profile '{name}' ({format_identity(info)})")
+    print(f"{verb} profile '{name}' ({format_identity(info)})")
     return True
 
 
@@ -384,47 +471,116 @@ def restart_app_server_daemon(assume_yes: bool = False) -> None:
     print("restarted the Codex app-server daemon")
 
 
-def restore_auth_from_backup(backup: Path | None) -> None:
+def raise_interrupted(signum: int, _frame: Any) -> None:
+    raise Interrupted(signum)
+
+
+@contextlib.contextmanager
+def termination_guard() -> Iterator[None]:
+    """Turn SIGTERM/SIGHUP into exceptions while a login swap is in flight."""
+    previous: dict[int, Any] = {}
+    for sig in TERMINATION_SIGNALS:
+        try:
+            previous[sig] = signal.signal(sig, raise_interrupted)
+        except (ValueError, OSError):
+            continue
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                continue
+
+
+def run_codex_login(operation: str, name: str) -> None:
+    """Park the active auth aside, then run `codex login --device-auth`.
+
+    The parked copy and a journal entry outlive the process, so a failed login,
+    Ctrl+C, closed terminal, or SIGKILL can all be rolled back -- immediately by
+    rollback_pending() for catchable exits, on the next run by
+    recover_interrupted() for SIGKILL. On return the fresh login is active and
+    the journal is still open: the caller must finish with clear_journal() or
+    rollback_pending().
+    """
     current = auth_path()
-    if backup and backup.exists():
-        atomic_copy(backup, current)
-    elif current.exists():
+    had_active = current.exists()
+    if had_active:
+        atomic_copy(current, pending_auth_path())
+    begin_journal(operation, name, had_active)
+
+    if had_active:
         current.unlink()
+    print(f"running: {codex_bin()} login --device-auth")
+
+    try:
+        with termination_guard():
+            result = subprocess.run([codex_bin(), "login", "--device-auth"])
+    except KeyboardInterrupt:
+        rollback_pending()
+        print("mcdx: interrupted; previous auth restored, no profile was changed", file=sys.stderr)
+        raise SystemExit(130)
+    except Interrupted as exc:
+        rollback_pending()
+        print("mcdx: terminated; previous auth restored, no profile was changed", file=sys.stderr)
+        raise SystemExit(128 + exc.signum)
+    if result.returncode != 0:
+        rollback_pending()
+        raise McdxError("codex login failed; previous auth restored")
+    if not current.exists():
+        rollback_pending()
+        raise McdxError("codex login did not create auth.json; previous auth restored")
 
 
 def cmd_add(args: argparse.Namespace) -> int:
     validate_profile_name(args.name)
     ensure_dirs()
-    current = auth_path()
-    backup: Path | None = None
-    with tempfile.TemporaryDirectory(prefix="mcdx-add-") as td:
-        td_path = Path(td)
-        if current.exists():
-            backup = td_path / "auth.backup.json"
-            atomic_copy(current, backup)
-            current.unlink()
+    run_codex_login("add", args.name)
+    try:
+        saved = save_profile(args.name, auth_path(), yes=args.yes)
+    except BaseException:
+        rollback_pending()
+        raise
+    if not saved:
+        rollback_pending()
+        print("add canceled; previous auth restored")
+        return 2
+    clear_journal()
+    print(f"active profile is now '{args.name}'")
+    if not args.no_daemon_restart:
+        restart_app_server_daemon(assume_yes=args.yes)
+    return 0
 
-        print(f"running: {codex_bin()} login --device-auth")
-        result = subprocess.run([codex_bin(), "login", "--device-auth"])
-        if result.returncode != 0:
-            restore_auth_from_backup(backup)
-            raise McdxError("codex login failed; previous auth restored")
-        if not current.exists():
-            restore_auth_from_backup(backup)
-            raise McdxError("codex login did not create auth.json; previous auth restored")
-        try:
-            saved = save_profile(args.name, current, yes=args.yes)
-        except Exception:
-            restore_auth_from_backup(backup)
-            raise
-        if not saved:
-            restore_auth_from_backup(backup)
-            print("add canceled; previous auth restored")
-            return 2
-        print(f"active profile is now '{args.name}'")
-        if not args.no_daemon_restart:
-            restart_app_server_daemon(assume_yes=args.yes)
-        return 0
+
+def cmd_update(args: argparse.Namespace) -> int:
+    """Log in again and replace a profile's credentials in place.
+
+    The profile and the active auth survive a failed login or an abandoned web
+    flow: an interrupted update is rolled back immediately, or on the next run
+    from the journal, so the old credentials are never lost.
+    """
+    validate_profile_name(args.name)
+    ensure_dirs()
+    target = profile_auth(args.name)
+    if not target.exists():
+        raise McdxError(f"profile not found: {args.name}")
+    old_info = auth_info(target)
+    run_codex_login("update", args.name)
+    print(f"previous: {format_identity(old_info)}")
+    try:
+        saved = save_profile(args.name, auth_path(), yes=True, allow_duplicate=True, verb="updated")
+    except BaseException:
+        rollback_pending()
+        raise
+    if not saved:  # yes=True cannot decline; defensive
+        rollback_pending()
+        print(f"update canceled; profile '{args.name}' unchanged")
+        return 2
+    clear_journal()
+    if not args.no_daemon_restart:
+        restart_app_server_daemon(assume_yes=args.yes)
+    return 0
 
 
 def cmd_switch(args: argparse.Namespace) -> int:
@@ -537,7 +693,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=cmd_add)
 
-    p = sub.add_parser("switch", help="switch active Codex auth to a profile")
+    p = sub.add_parser("switch", aliases=["use"], help="switch active Codex auth to a profile (alias: use)")
     p.add_argument("name")
     p.add_argument("-y", "--yes", action="store_true", help="answer yes to prompts (daemon restart)")
     p.add_argument(
@@ -546,6 +702,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not restart the Codex app-server daemon (it may keep using the previous account)",
     )
     p.set_defaults(func=cmd_switch)
+
+    p = sub.add_parser("update", help="log in again and refresh a profile's credentials in place")
+    p.add_argument("name")
+    p.add_argument("-y", "--yes", action="store_true", help="answer yes to prompts (daemon restart)")
+    p.add_argument(
+        "--no-daemon-restart",
+        action="store_true",
+        help="do not restart the Codex app-server daemon (it may keep using the previous account)",
+    )
+    p.set_defaults(func=cmd_update)
 
     p = sub.add_parser("remove", help="remove a saved profile")
     p.add_argument("name")
@@ -564,6 +730,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        recover_interrupted()
         return int(args.func(args))
     except McdxError as exc:
         print(f"mcdx: error: {exc}", file=sys.stderr)

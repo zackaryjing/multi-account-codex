@@ -52,12 +52,14 @@ mcdx add alt             # log in with Codex device auth, saved as a profile
 mcdx list                # list saved profiles (* marks the active one)
 mcdx current             # show the active profile
 mcdx switch main         # switch the active Codex auth
+mcdx use main            # alias for switch
+mcdx update main         # log in again to refresh an expired profile
 mcdx remove old-name     # delete a profile
 mcdx rename a b          # rename a profile
 mcdx doctor              # check paths, Codex binary and daemon status
 ```
 
-`mcdx add` and `mcdx switch` accept:
+`mcdx add`, `mcdx update`, and `mcdx switch` accept:
 
 | Flag                   | Effect                                                        |
 | ---------------------- | ------------------------------------------------------------- |
@@ -88,8 +90,15 @@ Environment overrides:
 - `mcdx add <name>` temporarily moves the active auth aside, runs
   `codex login --device-auth`, saves the resulting `auth.json`, and leaves the
   new profile active.
+- `mcdx update <name>` re-runs that login flow for an existing profile and
+  replaces its credentials in place, so an expired profile can be refreshed
+  without `remove` + `add`. On failure the profile and the active auth are left
+  untouched.
 - `mcdx switch <name>` saves the current auth as `_last` before switching.
 - Duplicate credentials are detected by `account_id` and `auth.json` SHA-256.
+- An interrupted `add`/`update` is rolled back immediately for catchable exits
+  (Ctrl+C, SIGTERM/SIGHUP from a closing terminal) and on the next `mcdx` run
+  for a hard kill, via a journal under the data directory.
 - Codex keeps a long-lived app-server daemon that reads `auth.json` once at
   startup, and sessions talk to that daemon rather than to the file. After
   `add`/`switch`, mcdx therefore runs `codex app-server daemon restart`; without

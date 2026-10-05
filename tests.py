@@ -37,22 +37,31 @@ def write_fake_codex(path: Path, codex_home: Path, state: Path) -> None:
     """Stand-in for the codex CLI: device-auth login plus app-server daemon control.
 
     Daemon status is read from `state/daemon_status` so tests can flip it, and
-    every restart is appended to `state/daemon_restarts`.
+    every restart is appended to `state/daemon_restarts`. Login behaviour is
+    driven by `state/login_mode` (ok | fail | sigint | sigterm), and the token
+    suffix by `state/login_token`.
     """
     path.write_text(
         f'''#!/usr/bin/env python3
 import json
+import os
+import signal
 import sys
+import time
 from pathlib import Path
 
 codex_home = Path({str(codex_home)!r})
 state = Path({str(state)!r})
 args = sys.argv[1:]
 
+
+def state_or(name, default):
+    f = state / name
+    return f.read_text().strip() if f.exists() else default
+
+
 if args[:3] == ["app-server", "daemon", "version"]:
-    status_file = state / "daemon_status"
-    status = status_file.read_text().strip() if status_file.exists() else "not running"
-    print(json.dumps({{"status": status}}))
+    print(json.dumps({{"status": state_or("daemon_status", "not running")}}))
     raise SystemExit(0)
 
 if args[:3] == ["app-server", "daemon", "restart"]:
@@ -62,11 +71,21 @@ if args[:3] == ["app-server", "daemon", "restart"]:
     raise SystemExit(0)
 
 if args[:1] == ["login"]:
+    mode = state_or("login_mode", "ok")
+    if mode == "fail":
+        print("fake codex: device auth denied", file=sys.stderr)
+        raise SystemExit(1)
+    if mode in ("sigint", "sigterm"):
+        # Stand in for Ctrl+C / a closing terminal killing mcdx mid-login.
+        os.kill(os.getppid(), signal.SIGINT if mode == "sigint" else signal.SIGTERM)
+        time.sleep(30)
+        raise SystemExit(0)
+    token = state_or("login_token", "new")
     codex_home.mkdir(parents=True, exist_ok=True)
     (codex_home / "auth.json").write_text(json.dumps({{
         "auth_mode": "chatgpt",
-        "tokens": {{"id_token": "id-new", "access_token": "access-new",
-                   "refresh_token": "refresh-new", "account_id": "acct-new"}},
+        "tokens": {{"id_token": "id-" + token, "access_token": "access-" + token,
+                   "refresh_token": "refresh-" + token, "account_id": "acct-new"}},
     }}))
     raise SystemExit(0)
 
@@ -187,6 +206,67 @@ def main() -> int:
         unreachable = run(broken, "switch", "main", "-y")
         assert account_of(auth) == "acct-main"
         assert "could not query the Codex app-server daemon" in unreachable.stderr
+
+        # `use` is an alias for switch.
+        used = run(env, "use", "new")
+        assert account_of(auth) == "acct-new"
+        assert "switched to 'new'" in used.stdout
+
+        # update re-logs in and replaces the profile's credentials in place.
+        (state / "login_token").write_text("refreshed")
+        (state / "daemon_status").write_text("running")
+        restarts_before = len(restarts(state))
+        refreshed = run(env, "update", "new", "-y")
+        assert "updated profile 'new'" in refreshed.stdout
+        assert len(restarts(state)) == restarts_before + 1
+        (state / "daemon_status").write_text("not running")
+        profile_new_auth = data_home / "profiles" / "new" / "auth.json"
+        assert json.loads(profile_new_auth.read_text())["tokens"]["id_token"] == "id-refreshed"
+        assert json.loads(auth.read_text())["tokens"]["id_token"] == "id-refreshed"
+        assert not (data_home / "in-progress.json").exists()
+        assert not (data_home / "in-progress-auth.json").exists()
+
+        # A failed login leaves both the profile and the active auth alone.
+        (state / "login_mode").write_text("fail")
+        failed = run(env, "update", "new", check=False)
+        assert failed.returncode == 1, failed
+        assert "previous auth restored" in failed.stderr
+        assert json.loads(profile_new_auth.read_text())["tokens"]["id_token"] == "id-refreshed"
+        assert account_of(auth) == "acct-new"
+        assert not (data_home / "in-progress.json").exists()
+
+        # Ctrl+C during the web login rolls the swap back and exits 130.
+        (state / "login_mode").write_text("sigint")
+        interrupted = run(env, "update", "new", check=False)
+        assert interrupted.returncode == 130, interrupted
+        assert "no profile was changed" in interrupted.stderr
+        assert json.loads(profile_new_auth.read_text())["tokens"]["id_token"] == "id-refreshed"
+        assert account_of(auth) == "acct-new"
+        assert not (data_home / "in-progress.json").exists()
+
+        # A closing terminal (SIGHUP/SIGTERM) takes the same rollback path.
+        (state / "login_mode").write_text("sigterm")
+        terminated = run(env, "update", "new", check=False)
+        assert terminated.returncode == 143, terminated
+        assert account_of(auth) == "acct-new"
+        assert not (data_home / "in-progress.json").exists()
+
+        # A hard kill cannot roll back in-process; the journal does it next run.
+        (state / "login_mode").write_text("ok")
+        pending = data_home / "in-progress-auth.json"
+        auth.unlink()
+        pending.write_text(json.dumps({
+            "auth_mode": "chatgpt",
+            "tokens": {"id_token": "id-main", "access_token": "access-main",
+                       "refresh_token": "refresh-main", "account_id": "acct-main"},
+        }))
+        (data_home / "in-progress.json").write_text(json.dumps({"operation": "update", "name": "new"}))
+        recovered = run(env, "list")
+        assert "recovered from an interrupted" in recovered.stderr
+        assert "update 'new'" in recovered.stderr
+        assert account_of(auth) == "acct-main"
+        assert not (data_home / "in-progress.json").exists()
+        assert not pending.exists()
 
     print("tests passed")
     return 0
