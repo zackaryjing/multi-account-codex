@@ -56,7 +56,9 @@ mcdx use main            # alias for switch
 mcdx update main         # log in again to refresh an expired profile
 mcdx remove old-name     # delete a profile
 mcdx rename a b          # rename a profile
-mcdx doctor              # check paths, Codex binary and daemon status
+mcdx proxy set http://127.0.0.1:10808   # proxy for codex logins and daemon restarts
+mcdx daemon restart      # restart the Codex app-server daemon (picks up the proxy)
+mcdx doctor              # check paths, Codex binary, proxy and daemon status
 ```
 
 `mcdx add`, `mcdx update`, and `mcdx switch` accept:
@@ -84,6 +86,33 @@ Environment overrides:
 | `MCDX_CODEX_HOME`   | `~/.codex`     | Codex home directory       |
 | `MCDX_DATA_HOME`    | `~/.local/share/mcdx` | mcdx data directory |
 | `MCDX_CODEX_BIN`    | `codex`        | Codex binary for `add` and daemon restarts |
+| `MCDX_PROXY`        | (unset)        | proxy URL for codex subprocesses, overriding the stored config |
+
+## Proxy
+
+On machines that can only reach `chatgpt.com` through a local proxy (e.g.
+v2rayN/Clash behind mirrored WSL networking), both `codex login` and the
+long-lived app-server daemon need the proxy in their environment. Configure it
+once per machine:
+
+```bash
+mcdx proxy set http://127.0.0.1:10808
+```
+
+mcdx then injects `http_proxy`/`https_proxy`/`all_proxy` into every codex
+subprocess it spawns:
+
+- `mcdx add` / `mcdx update` device-auth logins
+- app-server daemon restarts (after `add`/`switch`/`update`, and `mcdx daemon restart`)
+
+Since daemons inherit their environment at spawn time, `mcdx daemon restart` is
+also the recovery command when a daemon was started elsewhere without the
+proxy and codex hangs on network errors.
+
+mcdx cannot affect codex processes you start yourself — launch those with the
+proxy already in your shell environment (or through a wrapper that exports
+it). `mcdx proxy show` displays the active value, `mcdx proxy clear` removes
+it, and `MCDX_PROXY` overrides the stored config for one invocation.
 
 ## Behavior
 

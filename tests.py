@@ -60,17 +60,27 @@ def state_or(name, default):
     return f.read_text().strip() if f.exists() else default
 
 
+def note_proxy():
+    # Record which proxy came in through the environment, so tests can assert
+    # mcdx injected the configured proxy into this subprocess.
+    proxy = os.environ.get("https_proxy") or os.environ.get("all_proxy") or ""
+    with (state / "proxy_seen").open("a") as fh:
+        fh.write(proxy + "\\n")
+
+
 if args[:3] == ["app-server", "daemon", "version"]:
     print(json.dumps({{"status": state_or("daemon_status", "not running")}}))
     raise SystemExit(0)
 
 if args[:3] == ["app-server", "daemon", "restart"]:
+    note_proxy()
     with (state / "daemon_restarts").open("a") as fh:
         fh.write("restart\\n")
     print(json.dumps({{"status": "restarted"}}))
     raise SystemExit(0)
 
 if args[:1] == ["login"]:
+    note_proxy()
     mode = state_or("login_mode", "ok")
     if mode == "fail":
         print("fake codex: device auth denied", file=sys.stderr)
@@ -267,6 +277,47 @@ def main() -> int:
         assert account_of(auth) == "acct-main"
         assert not (data_home / "in-progress.json").exists()
         assert not pending.exists()
+
+        # Proxy config: set/show/clear plus scheme validation.
+        assert "no proxy configured" in run(env, "proxy", "show").stdout
+        bad = run(env, "proxy", "set", "ftp://nope", check=False)
+        assert bad.returncode == 1
+        assert "scheme" in bad.stderr
+        run(env, "proxy", "set", "http://127.0.0.1:19999")
+        assert "http://127.0.0.1:19999" in run(env, "proxy", "show").stdout
+        assert "http://127.0.0.1:19999" in run(env, "doctor").stdout
+
+        # Daemon restarts after switch, and the standalone command, inherit it.
+        (state / "daemon_status").write_text("running")
+        restarts_before = len(restarts(state))
+        run(env, "switch", "main", "-y")
+        assert len(restarts(state)) == restarts_before + 1
+        assert (state / "proxy_seen").read_text().splitlines()[-1] == "http://127.0.0.1:19999"
+
+        restarts_before = len(restarts(state))
+        run(env, "daemon", "restart")
+        assert len(restarts(state)) == restarts_before + 1
+        assert (state / "proxy_seen").read_text().splitlines()[-1] == "http://127.0.0.1:19999"
+
+        # The login of an update is injected too (daemon not running -> no restart).
+        (state / "daemon_status").write_text("not running")
+        run(env, "update", "main", "-y")
+        assert (state / "proxy_seen").read_text().splitlines()[-1] == "http://127.0.0.1:19999"
+
+        # MCDX_PROXY overrides the stored config (socks URLs go through all_proxy).
+        override = dict(env)
+        override["MCDX_PROXY"] = "socks5h://127.0.0.1:18888"
+        shown = run(override, "proxy", "show").stdout
+        assert "socks5h://127.0.0.1:18888" in shown and "MCDX_PROXY" in shown
+        run(override, "daemon", "restart")
+        assert (state / "proxy_seen").read_text().splitlines()[-1] == "socks5h://127.0.0.1:18888"
+
+        # Clearing falls back to the plain environment.
+        run(env, "proxy", "clear")
+        assert "no proxy configured" in run(env, "proxy", "show").stdout
+        run(env, "daemon", "restart")
+        baseline = env.get("https_proxy") or env.get("all_proxy") or ""
+        assert (state / "proxy_seen").read_text().splitlines()[-1] == baseline
 
     print("tests passed")
     return 0

@@ -23,8 +23,9 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 
 PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -33,6 +34,7 @@ RESERVED_PROFILES = {RESERVED_LAST}
 
 DAEMON_QUERY_TIMEOUT = 15
 DAEMON_RESTART_TIMEOUT = 120
+PROXY_SCHEMES = ("http", "https", "socks5", "socks5h", "socks4", "socks4a")
 TERMINATION_SIGNALS = tuple(
     sig for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)) if sig is not None
 )
@@ -279,6 +281,67 @@ def recover_interrupted() -> None:
         )
 
 
+def config_path() -> Path:
+    return data_home() / "config.json"
+
+
+def load_config() -> dict[str, Any]:
+    path = config_path()
+    if not path.exists():
+        return {}
+    try:
+        return load_json(path)
+    except McdxError:
+        print(f"mcdx: warning: ignoring unreadable config: {path}", file=sys.stderr)
+        return {}
+
+
+def save_config(config: dict[str, Any]) -> None:
+    data_dir = data_home()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(data_dir, 0o700)
+    tmp = config_path().with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, config_path())
+
+
+def validate_proxy_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in PROXY_SCHEMES or not parsed.netloc:
+        raise McdxError(
+            "proxy URL must look like http://host:port"
+            f" (supported schemes: {', '.join(PROXY_SCHEMES)})"
+        )
+    return url
+
+
+def proxy_url() -> str | None:
+    env_url = os.environ.get("MCDX_PROXY")
+    if env_url:
+        return env_url
+    stored = load_config().get("proxy")
+    return str(stored) if stored else None
+
+
+def codex_env() -> dict[str, str]:
+    """Environment for codex subprocesses, with the configured proxy applied."""
+    env = os.environ.copy()
+    url = proxy_url()
+    if not url:
+        return env
+    if urlparse(url).scheme.lower().startswith("socks"):
+        env["all_proxy"] = url
+    else:
+        env["http_proxy"] = url
+        env["https_proxy"] = url
+        env["all_proxy"] = url
+    env.setdefault("no_proxy", "localhost,127.0.0.1,::1")
+    return env
+
+
 def write_metadata(name: str, info: dict[str, Any], created_at: str | None = None) -> None:
     meta_path = profile_meta(name)
     existing = load_metadata(name) if meta_path.exists() else None
@@ -459,6 +522,7 @@ def restart_app_server_daemon(assume_yes: bool = False) -> None:
             stderr=subprocess.PIPE,
             text=True,
             timeout=DAEMON_RESTART_TIMEOUT,
+            env=codex_env(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"mcdx: warning: could not restart the app-server daemon ({exc})", file=sys.stderr)
@@ -516,7 +580,7 @@ def run_codex_login(operation: str, name: str) -> None:
 
     try:
         with termination_guard():
-            result = subprocess.run([codex_bin(), "login", "--device-auth"])
+            result = subprocess.run([codex_bin(), "login", "--device-auth"], env=codex_env())
     except KeyboardInterrupt:
         rollback_pending()
         print("mcdx: interrupted; previous auth restored, no profile was changed", file=sys.stderr)
@@ -647,6 +711,50 @@ def cmd_rename(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_proxy_set(args: argparse.Namespace) -> int:
+    config = load_config()
+    config["proxy"] = validate_proxy_url(args.url)
+    save_config(config)
+    print(f"proxy set to {args.url}")
+    print("the proxy must be running whenever codex subprocesses spawn (login, daemon restarts)")
+    return 0
+
+
+def cmd_proxy_show(_: argparse.Namespace) -> int:
+    url = proxy_url()
+    if not url:
+        print("no proxy configured")
+        return 0
+    source = "MCDX_PROXY" if os.environ.get("MCDX_PROXY") else "config"
+    print(f"proxy: {url} ({source})")
+    return 0
+
+
+def cmd_proxy_clear(_: argparse.Namespace) -> int:
+    config = load_config()
+    if config.pop("proxy", None) is None:
+        print("no proxy configured")
+        return 0
+    save_config(config)
+    print("proxy cleared")
+    return 0
+
+
+def cmd_daemon_restart(_: argparse.Namespace) -> int:
+    url = proxy_url()
+    if url:
+        print(f"restarting the Codex app-server daemon with proxy {url}")
+    else:
+        print("restarting the Codex app-server daemon")
+    try:
+        result = subprocess.run([codex_bin(), "app-server", "daemon", "restart"], env=codex_env())
+    except OSError as exc:
+        raise McdxError(f"could not run {codex_bin()}: {exc}") from exc
+    if result.returncode != 0:
+        raise McdxError(f"app-server daemon restart failed (exit code {result.returncode})")
+    return 0
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
     def missing_status(path: Path) -> str:
         ancestor = path.parent
@@ -660,6 +768,12 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     print(f"codex bin:  {shutil.which(codex_bin()) or 'not found'}")
     print(f"auth:       {format_identity(current_info()) if auth_path().exists() else 'missing'}")
     print(f"profiles:   {len(list_profile_names())}")
+    url = proxy_url()
+    if url:
+        source = "MCDX_PROXY" if os.environ.get("MCDX_PROXY") else "config"
+        print(f"proxy:      {url} ({source})")
+    else:
+        print("proxy:      not configured")
     daemon = app_server_daemon_status()
     print(f"daemon:     {daemon or 'unknown (could not run: codex app-server daemon version)'}")
     for path in [codex_home(), profiles_dir()]:
@@ -712,6 +826,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not restart the Codex app-server daemon (it may keep using the previous account)",
     )
     p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("proxy", help="configure the proxy used for codex subprocesses")
+    psub = p.add_subparsers(dest="proxy_command", required=True)
+    pset = psub.add_parser("set", help="set the proxy URL for codex subprocesses")
+    pset.add_argument("url")
+    pset.set_defaults(func=cmd_proxy_set)
+    psub.add_parser("show", help="show the configured proxy").set_defaults(func=cmd_proxy_show)
+    psub.add_parser("clear", help="remove the configured proxy").set_defaults(func=cmd_proxy_clear)
+
+    p = sub.add_parser("daemon", help="manage the Codex app-server daemon")
+    dsub = p.add_subparsers(dest="daemon_command", required=True)
+    dsub.add_parser(
+        "restart",
+        help="restart the Codex app-server daemon (with the configured proxy, when set)",
+    ).set_defaults(func=cmd_daemon_restart)
 
     p = sub.add_parser("remove", help="remove a saved profile")
     p.add_argument("name")
