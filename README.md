@@ -49,6 +49,7 @@ Make sure `~/.local/bin` is on your `PATH`.
 ```bash
 mcdx save-current main   # save your current login as a profile
 mcdx add alt             # log in with Codex device auth, saved as a profile
+mcdx add alt -b          # same, but with the browser login flow (no device code)
 mcdx list                # list saved profiles (* marks the active one)
 mcdx current             # show the active profile
 mcdx switch main         # switch the active Codex auth
@@ -66,6 +67,7 @@ mcdx doctor              # check paths, Codex binary, proxy and daemon status
 | Flag                   | Effect                                                        |
 | ---------------------- | ------------------------------------------------------------- |
 | `-y`, `--yes`          | answer yes to prompts, including the daemon restart           |
+| `-b`, `--browser`      | use the browser login flow instead of device auth (`add`/`update`) |
 | `--no-daemon-restart`  | leave the Codex app-server daemon running as it is            |
 
 ## Where things live
@@ -109,6 +111,9 @@ Since daemons inherit their environment at spawn time, `mcdx daemon restart` is
 also the recovery command when a daemon was started elsewhere without the
 proxy and codex hangs on network errors.
 
+A configured proxy replaces `http_proxy`/`https_proxy`/`all_proxy` that the
+shell already exported, so the stored config always wins.
+
 mcdx cannot affect codex processes you start yourself — launch those with the
 proxy already in your shell environment (or through a wrapper that exports
 it). `mcdx proxy show` displays the active value, `mcdx proxy clear` removes
@@ -117,8 +122,9 @@ it, and `MCDX_PROXY` overrides the stored config for one invocation.
 ## Behavior
 
 - `mcdx add <name>` temporarily moves the active auth aside, runs
-  `codex login --device-auth`, saves the resulting `auth.json`, and leaves the
-  new profile active.
+  `codex login --device-auth` (or `codex login` with `-b`, which opens a URL and
+  listens on localhost for the OAuth callback), saves the resulting `auth.json`,
+  and leaves the new profile active.
 - `mcdx update <name>` re-runs that login flow for an existing profile and
   replaces its credentials in place, so an expired profile can be refreshed
   without `remove` + `add`. On failure the profile and the active auth are left

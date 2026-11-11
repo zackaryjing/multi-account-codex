@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlparse
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 
 PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -327,12 +327,21 @@ def proxy_url() -> str | None:
 
 
 def codex_env() -> dict[str, str]:
-    """Environment for codex subprocesses, with the configured proxy applied."""
+    """Environment for codex subprocesses, with the configured proxy applied.
+
+    A configured proxy replaces whatever proxy the shell already exported, so
+    the config always wins instead of silently mixing with MCDX_PROXY-inherited
+    values.
+    """
     env = os.environ.copy()
     url = proxy_url()
     if not url:
         return env
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        env.pop(name, None)
     if urlparse(url).scheme.lower().startswith("socks"):
+        env.pop("http_proxy", None)
+        env.pop("https_proxy", None)
         env["all_proxy"] = url
     else:
         env["http_proxy"] = url
@@ -558,8 +567,12 @@ def termination_guard() -> Iterator[None]:
                 continue
 
 
-def run_codex_login(operation: str, name: str) -> None:
-    """Park the active auth aside, then run `codex login --device-auth`.
+def run_codex_login(operation: str, name: str, browser: bool = False) -> None:
+    """Park the active auth aside, then run `codex login`.
+
+    Device auth (`--device-auth`) is the default; `browser=True` uses codex's
+    browser flow (`codex login`), which opens a URL and listens on localhost for
+    the OAuth callback instead of asking for a device code.
 
     The parked copy and a journal entry outlive the process, so a failed login,
     Ctrl+C, closed terminal, or SIGKILL can all be rolled back -- immediately by
@@ -576,11 +589,12 @@ def run_codex_login(operation: str, name: str) -> None:
 
     if had_active:
         current.unlink()
-    print(f"running: {codex_bin()} login --device-auth")
+    login_command = [codex_bin(), "login"] + ([] if browser else ["--device-auth"])
+    print(f"running: {' '.join(login_command)}")
 
     try:
         with termination_guard():
-            result = subprocess.run([codex_bin(), "login", "--device-auth"], env=codex_env())
+            result = subprocess.run(login_command, env=codex_env())
     except KeyboardInterrupt:
         rollback_pending()
         print("mcdx: interrupted; previous auth restored, no profile was changed", file=sys.stderr)
@@ -600,7 +614,7 @@ def run_codex_login(operation: str, name: str) -> None:
 def cmd_add(args: argparse.Namespace) -> int:
     validate_profile_name(args.name)
     ensure_dirs()
-    run_codex_login("add", args.name)
+    run_codex_login("add", args.name, browser=args.browser)
     try:
         saved = save_profile(args.name, auth_path(), yes=args.yes)
     except BaseException:
@@ -630,7 +644,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     if not target.exists():
         raise McdxError(f"profile not found: {args.name}")
     old_info = auth_info(target)
-    run_codex_login("update", args.name)
+    run_codex_login("update", args.name, browser=args.browser)
     print(f"previous: {format_identity(old_info)}")
     try:
         saved = save_profile(args.name, auth_path(), yes=True, allow_duplicate=True, verb="updated")
@@ -797,9 +811,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-y", "--yes", action="store_true", help="answer yes to overwrite/duplicate prompts")
     p.set_defaults(func=cmd_save_current)
 
-    p = sub.add_parser("add", help="login with Codex device auth and save as a profile")
+    p = sub.add_parser("add", help="log in (device auth, or -b for browser) and save as a profile")
     p.add_argument("name")
     p.add_argument("-y", "--yes", action="store_true", help="answer yes to prompts (overwrite/duplicate, daemon restart)")
+    p.add_argument(
+        "-b",
+        "--browser",
+        action="store_true",
+        help="use the browser login flow instead of device auth",
+    )
     p.add_argument(
         "--no-daemon-restart",
         action="store_true",
@@ -820,6 +840,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("update", help="log in again and refresh a profile's credentials in place")
     p.add_argument("name")
     p.add_argument("-y", "--yes", action="store_true", help="answer yes to prompts (daemon restart)")
+    p.add_argument(
+        "-b",
+        "--browser",
+        action="store_true",
+        help="use the browser login flow instead of device auth",
+    )
     p.add_argument(
         "--no-daemon-restart",
         action="store_true",

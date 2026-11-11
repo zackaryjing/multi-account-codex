@@ -81,6 +81,8 @@ if args[:3] == ["app-server", "daemon", "restart"]:
 
 if args[:1] == ["login"]:
     note_proxy()
+    with (state / "login_args").open("a") as fh:
+        fh.write(" ".join(args[1:]) + "\\n")
     mode = state_or("login_mode", "ok")
     if mode == "fail":
         print("fake codex: device auth denied", file=sys.stderr)
@@ -144,6 +146,10 @@ def main() -> int:
         env["MCDX_CODEX_HOME"] = str(codex_home)
         env["MCDX_DATA_HOME"] = str(data_home)
         env["MCDX_CODEX_BIN"] = str(base / "fake-codex")
+        # Pretend the developer's shell exported a different proxy: the mcdx
+        # config must win over it whenever one is set.
+        env["https_proxy"] = "http://127.0.0.1:17777"
+        env["all_proxy"] = "socks5h://127.0.0.1:17777"
         write_fake_codex(base / "fake-codex", codex_home, state)
 
         write_auth(auth, "acct-main", "main")
@@ -277,6 +283,15 @@ def main() -> int:
         assert account_of(auth) == "acct-main"
         assert not (data_home / "in-progress.json").exists()
         assert not pending.exists()
+
+        # -b/--browser switches the login flow from device auth to the browser flow.
+        (state / "daemon_status").write_text("not running")
+        run(env, "add", "browser-prof", "-b", "-y")
+        assert (state / "login_args").read_text().splitlines()[-1] == ""
+        run(env, "add", "device-prof", "-y")
+        assert (state / "login_args").read_text().splitlines()[-1] == "--device-auth"
+        run(env, "update", "browser-prof", "-b", "-y")
+        assert (state / "login_args").read_text().splitlines()[-1] == ""
 
         # Proxy config: set/show/clear plus scheme validation.
         assert "no proxy configured" in run(env, "proxy", "show").stdout
