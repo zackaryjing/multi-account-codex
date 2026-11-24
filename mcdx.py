@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlparse
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 
 PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
