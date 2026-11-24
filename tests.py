@@ -132,6 +132,65 @@ def account_of(path: Path) -> str:
     return json.loads(path.read_text())["tokens"]["account_id"]
 
 
+def test_profile_transfer(env: dict[str, str], base: Path) -> None:
+    original = Path(env["MCDX_DATA_HOME"]) / "profiles" / "main"
+    auth_bytes = (original / "auth.json").read_bytes()
+    archive = base / "main.mcdx"
+    exported = run(env, "export", "main", str(archive))
+    assert "access-main" not in exported.stdout
+    assert archive.stat().st_mode & 0o777 == 0o600
+    contents = archive.read_bytes()
+    assert run(env, "export", "alt", str(archive), check=False).returncode == 1
+    assert archive.read_bytes() == contents
+
+    destination = base / "destination"
+    profiles = destination / "data" / "profiles"
+    active_auth = destination / "codex" / "auth.json"
+    dest_env = {
+        **env,
+        "MCDX_DATA_HOME": str(profiles.parent),
+        "MCDX_CODEX_HOME": str(active_auth.parent),
+        "MCDX_CODEX_BIN": str(destination / "missing-codex"),
+    }
+    write_auth(active_auth, "acct-destination")
+    active_bytes = active_auth.read_bytes()
+    run(dest_env, "import", str(archive))
+    imported = profiles / "main"
+    assert (imported / "auth.json").read_bytes() == auth_bytes
+    assert (imported / "auth.json").stat().st_mode & 0o777 == 0o600
+    assert imported.stat().st_mode & 0o777 == 0o700
+    metadata = json.loads((imported / "metadata.json").read_text())
+    original_metadata = json.loads((original / "metadata.json").read_text())
+    assert metadata["auth_sha256"] == original_metadata["auth_sha256"]
+    assert metadata["created_at"] == original_metadata["created_at"]
+    assert active_auth.read_bytes() == active_bytes
+    assert "main" in run(dest_env, "list").stdout
+
+    conflict = run(dest_env, "import", str(archive), "-y", check=False)
+    assert conflict.returncode == 1 and "profile already exists" in conflict.stderr
+    assert (imported / "auth.json").read_bytes() == auth_bytes
+    duplicate = run(dest_env, "import", str(archive), "--name", "work", check=False)
+    assert duplicate.returncode == 2 and "same credential already exists" in duplicate.stderr
+    run(dest_env, "import", str(archive), "--name", "work", "-y")
+    assert (profiles / "work" / "auth.json").read_bytes() == auth_bytes
+
+    bundle = json.loads(contents)
+    invalid = base / "invalid.mcdx"
+    for corrupted in (
+        {**bundle, "format": "mcdx-profile-v2"},
+        {**bundle, "name": "../outside"},
+        {**bundle, "name": "broken", "auth_json": "{}"},
+    ):
+        invalid.write_text(json.dumps(corrupted), encoding="utf-8")
+        assert run(dest_env, "import", str(invalid), check=False).returncode == 1
+    assert sorted(p.name for p in profiles.iterdir()) == ["main", "work"]
+    assert not (profiles.parent / "outside").exists()
+
+    run(dest_env, "switch", "main", "--no-daemon-restart")
+    assert active_auth.read_bytes() == auth_bytes
+    assert "current: main" in run(dest_env, "current").stdout
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="mcdx-test-") as td:
         base = Path(td)
@@ -159,6 +218,7 @@ def main() -> int:
 
         write_auth(auth, "acct-alt", "alt")
         run(env, "save-current", "alt", "-y")
+        test_profile_transfer(env, base)
 
         # No daemon running: switching is a plain file swap, no restart needed.
         run(env, "switch", "main")

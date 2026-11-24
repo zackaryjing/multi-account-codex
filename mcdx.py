@@ -31,6 +31,7 @@ __version__ = "0.5.0"
 PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RESERVED_LAST = "_last"
 RESERVED_PROFILES = {RESERVED_LAST}
+PROFILE_EXPORT_FORMAT = "mcdx-profile-v1"
 
 DAEMON_QUERY_TIMEOUT = 15
 DAEMON_RESTART_TIMEOUT = 120
@@ -351,9 +352,15 @@ def codex_env() -> dict[str, str]:
     return env
 
 
-def write_metadata(name: str, info: dict[str, Any], created_at: str | None = None) -> None:
-    meta_path = profile_meta(name)
-    existing = load_metadata(name) if meta_path.exists() else None
+def write_metadata(
+    name: str,
+    info: dict[str, Any],
+    created_at: str | None = None,
+    *,
+    destination: Path | None = None,
+) -> None:
+    meta_path = destination if destination is not None else profile_meta(name)
+    existing = load_json(meta_path) if meta_path.exists() else None
     metadata = {
         "name": name,
         "auth_mode": info.get("auth_mode"),
@@ -456,6 +463,98 @@ def cmd_save_current(args: argparse.Namespace) -> int:
     if not path.exists():
         raise McdxError(f"current auth does not exist: {path}")
     return 0 if save_profile(args.name, path, yes=args.yes) else 2
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    source = profile_auth(args.name)
+    if not source.is_file():
+        raise McdxError(f"profile not found: {args.name}")
+    destination = Path(args.path).expanduser()
+    try:
+        auth_info(source)
+        metadata = load_metadata(args.name) or {}
+        bundle = {
+            "format": PROFILE_EXPORT_FORMAT,
+            "name": args.name,
+            "auth_json": source.read_bytes().decode("utf-8"),
+            "created_at": metadata.get("created_at"),
+        }
+        contents = json.dumps(bundle, indent=2) + "\n"
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                output.write(contents)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                destination.unlink()
+            raise
+    except FileExistsError as exc:
+        raise McdxError(f"export file already exists: {destination}") from exc
+    except UnicodeError as exc:
+        raise McdxError(f"invalid UTF-8 in profile '{args.name}'") from exc
+    except OSError as exc:
+        raise McdxError(f"cannot export profile '{args.name}': {exc}") from exc
+
+    print(f"exported profile '{args.name}' to {destination}")
+    return 0
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    source = Path(args.path).expanduser()
+    try:
+        bundle = load_json(source)
+        if bundle.get("format") != PROFILE_EXPORT_FORMAT:
+            raise McdxError(f"unsupported profile export format: {source}")
+        original_name = bundle.get("name")
+        auth_json = bundle.get("auth_json")
+        if not isinstance(original_name, str) or not isinstance(auth_json, str):
+            raise McdxError(f"invalid profile export: {source}")
+        validate_profile_name(original_name)
+        name = args.name if args.name is not None else original_name
+        target = profile_dir(name)
+        if name in RESERVED_PROFILES or name == "_current":
+            raise McdxError(f"'{name}' is reserved. Choose a different profile name with --name.")
+
+        ensure_dirs()
+        if target.exists() or target.is_symlink():
+            raise McdxError(f"profile already exists: {name}")
+
+        # Publish both files together after validation so list and switch see a complete profile.
+        with tempfile.TemporaryDirectory(prefix=".mcdx-import-", dir=profiles_dir()) as work:
+            staged = Path(work) / "profile"
+            staged.mkdir(mode=0o700)
+            staged_auth = staged / "auth.json"
+            staged_auth.write_bytes(auth_json.encode("utf-8"))
+            staged_auth.chmod(0o600)
+            info = auth_info(staged_auth)
+            if not isinstance(info["auth_mode"], str):
+                raise McdxError(f"invalid auth_mode in profile export: {source}")
+            duplicates = find_matching_profiles(info)
+            if duplicates:
+                joined = ", ".join(duplicates)
+                if not prompt_yes_no(f"same credential already exists as: {joined}. Import anyway?", False, args.yes):
+                    return 2
+
+            created_at = bundle.get("created_at")
+            write_metadata(
+                name,
+                info,
+                created_at=created_at if isinstance(created_at, str) else None,
+                destination=staged / "metadata.json",
+            )
+            try:
+                staged.rename(target)
+            except OSError as exc:
+                if target.exists() or target.is_symlink():
+                    raise McdxError(f"profile already exists: {name}") from exc
+                raise
+    except UnicodeError as exc:
+        raise McdxError(f"invalid UTF-8 in profile export: {source}") from exc
+    except OSError as exc:
+        raise McdxError(f"cannot import profile from {source}: {exc}") from exc
+
+    print(f"imported profile '{name}'")
+    return 0
 
 
 def codex_bin() -> str:
@@ -810,6 +909,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("-y", "--yes", action="store_true", help="answer yes to overwrite/duplicate prompts")
     p.set_defaults(func=cmd_save_current)
+
+    p = sub.add_parser("export", help="export a saved profile to a file")
+    p.add_argument("name", metavar="profile")
+    p.add_argument("path")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("import", help="import a saved profile from an export file")
+    p.add_argument("path")
+    p.add_argument("--name", help="save under a different profile name")
+    p.add_argument("-y", "--yes", action="store_true", help="allow importing duplicate credentials")
+    p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("add", help="log in (device auth, or -b for browser) and save as a profile")
     p.add_argument("name")

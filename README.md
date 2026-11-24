@@ -70,6 +70,30 @@ mcdx doctor              # check paths, Codex binary, proxy and daemon status
 | `-b`, `--browser`      | use the browser login flow instead of device auth (`add`/`update`) |
 | `--no-daemon-restart`  | leave the Codex app-server daemon running as it is            |
 
+## Transfer a profile to another machine
+
+Export a saved profile on the source machine.
+
+```bash
+mcdx export main ./main.mcdx
+```
+
+Copy `main.mcdx` to the destination machine. With a version of `mcdx` that
+supports profile transfers, import it and use `switch` to activate it.
+
+```bash
+mcdx import ./main.mcdx
+mcdx switch main
+```
+
+Import uses the original profile name and requires no Codex login. Use
+`mcdx import ./main.mcdx --name work` to choose a different name if `main`
+already exists. `-y` accepts the prompt to import duplicate credentials under
+a different name.
+
+Export creates a new file with `0600` permissions. The file contains
+unencrypted login credentials, so transfer it privately.
+
 ## Where things live
 
 Profiles are stored under:
